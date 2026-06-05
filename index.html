@@ -6,6 +6,7 @@
 <title>Banco de Horas — Sistema de Ponto</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
+<script src="config.js"></script>
 <style>
   :root {
     --bg: #111318;
@@ -498,8 +499,9 @@
         <label>Mês / Ano</label>
         <input type="month" id="cfg-mes" value="">
       </div>
-      <div style="margin-top:14px">
-        <button class="btn" onclick="gerarTabela()">▶ Gerar Tabela de Ponto</button>
+      <div style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn" onclick="gerarTabela()">▶ Gerar Tabela</button>
+        <button class="btn secondary" onclick="carregarPontoSupabase()" title="Busca as batidas salvas no Supabase para este funcionário e mês">☁ Carregar Ponto</button>
       </div>
     </div>
 
@@ -658,6 +660,9 @@
 <div class="modal-backdrop" id="modal-config-db">
   <div class="modal">
     <h2>⚙ Configurar Supabase</h2>
+    <div id="sb-config-notice" style="display:none;background:rgba(61,220,132,0.1);border:1px solid var(--accent3);border-radius:5px;padding:10px 12px;margin-bottom:14px;font-size:11px;color:var(--accent3)">
+      ✓ Credenciais carregadas do <strong>config.js</strong>. Para alterar, edite o arquivo no GitHub.
+    </div>
     <div class="form-group" style="margin-bottom:12px">
       <label>URL do Projeto Supabase</label>
       <input type="text" id="sb-url" placeholder="https://xxxxx.supabase.co">
@@ -667,26 +672,13 @@
       <input type="text" id="sb-key" placeholder="eyJhbGciOi...">
     </div>
     <div style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px;margin-bottom:16px;font-size:11px;color:var(--muted);line-height:1.8">
-      <strong style="color:var(--accent)">SQL para criar a tabela no Supabase:</strong><br>
-      <code style="color:var(--text);display:block;margin-top:6px;white-space:pre-wrap">CREATE TABLE banco_horas (
-  id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
-  funcionario text NOT NULL,
-  mes_ref text NOT NULL,
-  dia integer NOT NULL,
-  data_str text,
-  he_50 numeric DEFAULT 0,
-  he_100 numeric DEFAULT 0,
-  atraso numeric DEFAULT 0,
-  intrajornada numeric DEFAULT 0,
-  add_noturno numeric DEFAULT 0,
-  add_noturno_red numeric DEFAULT 0,
-  falta boolean DEFAULT false,
-  created_at timestamptz DEFAULT now()
-);</code>
+      <strong style="color:var(--accent)">💡 Dica:</strong> Edite o arquivo <code style="color:var(--text)">config.js</code> no GitHub com sua URL e chave.<br>
+      Assim o sistema conecta automaticamente em qualquer dispositivo.<br>
+      O SQL para criar as tabelas está comentado dentro do <code style="color:var(--text)">config.js</code>.
     </div>
     <div style="display:flex;gap:8px;justify-content:flex-end">
-      <button class="btn secondary" onclick="closeModal('modal-config-db')">Cancelar</button>
-      <button class="btn" onclick="salvarConfigDB()">Conectar</button>
+      <button class="btn secondary" onclick="closeModal('modal-config-db')">Fechar</button>
+      <button class="btn" onclick="salvarConfigDB()">Salvar e Conectar</button>
     </div>
   </div>
 </div>
@@ -727,12 +719,9 @@ function loadLocal() {
         });
       }
       renderFeriados();
-      if (state.supabase?.url) {
-        document.getElementById('sb-url').value = state.supabase.url;
-        document.getElementById('sb-key').value = state.supabase.key;
-        testarConexao();
-      }
     }
+    // Sempre testa conexão — usa config.js se disponível, senão localStorage
+    testarConexao();
   } catch(e) { console.warn('Load state error', e); }
 }
 
@@ -1120,97 +1109,185 @@ function nomeMes(m) { return MESES[m-1]; }
 // ═══════════════════════════════════════════════
 //  SALVAR / SUPABASE
 // ═══════════════════════════════════════════════
+
+// Pega credenciais: config.js tem prioridade, depois localStorage
+function getSB() {
+  const fromConfig = (typeof SUPABASE_CONFIG !== 'undefined' &&
+                      SUPABASE_CONFIG.url &&
+                      !SUPABASE_CONFIG.url.includes('SEU-PROJETO'));
+  if (fromConfig) return SUPABASE_CONFIG;
+  return state.supabase;
+}
+
+function sbHeaders(key) {
+  return {
+    'apikey': key,
+    'Authorization': `Bearer ${key}`,
+    'Content-Type': 'application/json',
+    'Prefer': 'return=minimal'
+  };
+}
+
 async function salvarDados() {
   saveLocal();
-  if (!state.supabase.url || !state.supabase.key) {
-    toast('Dados salvos localmente. Configure o Supabase para sincronizar.', 'success');
+  const { url, key } = getSB();
+  if (!url || !key) {
+    toast('Dados salvos localmente. Preencha o config.js para sincronizar.', 'success');
     return;
   }
-  // Sincroniza banco de horas no Supabase
   await sincronizarSupabase();
 }
 
 async function sincronizarSupabase() {
   colherConfig();
-  const { url, key } = state.supabase;
+  const { url, key } = getSB();
+  if (!url || !key) return;
+
   const [ano, mes] = state.mesRef.split('-').map(Number);
   const diasNoMes = new Date(ano, mes, 0).getDate();
 
-  const registros = [];
-  for (let d = 1; d <= diasNoMes; d++) {
-    const k = `${ano}-${String(mes).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
-    const salvo = state.pontoDados[k] || {};
-    const dt = new Date(ano, mes-1, d);
-    const dow = dt.getDay();
-    const cargaMin = (state.carga[dow] || 0) * 60;
-    const ehFeriado = isFeriado(d);
-    const falta = salvo.falta || false;
+  const pontoRows  = [];   // batidas brutas → ponto_registros
+  const bancoRows  = [];   // totalizadores  → banco_horas
 
+  for (let d = 1; d <= diasNoMes; d++) {
+    const k   = `${ano}-${String(mes).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+    const salvo = state.pontoDados[k] || {};
+    const dt    = new Date(ano, mes-1, d);
+    const dow   = dt.getDay();
+    const cargaH  = state.carga[dow] || 0;
+    const cargaMin = cargaH * 60;
+    const ehFeriado = isFeriado(d);
+    const falta  = salvo.falta || false;
     const e1 = salvo.e1||'', s1 = salvo.s1||'', e2 = salvo.e2||'', s2 = salvo.s2||'';
+
+    // Só salva dias que têm algum lançamento
+    if (!e1 && !s1 && !e2 && !s2 && !falta) continue;
+
+    // ── ponto_registros (batidas brutas) ──
+    pontoRows.push({
+      funcionario: state.funcionario,
+      mes_ref: state.mesRef,
+      data_str: k,
+      dia: d,
+      e1: e1 || null,
+      s1: s1 || null,
+      e2: e2 || null,
+      s2: s2 || null,
+      falta,
+      feriado: ehFeriado,
+      carga_horas: cargaH
+    });
+
+    // ── banco_horas (totalizadores calculados) ──
     const t1 = e1 && s1 ? diffMin(e1, s1) : 0;
     const t2 = e2 && s2 ? diffMin(e2, s2) : 0;
     const totalMin = t1 + t2;
 
-    if (totalMin === 0 && !falta) continue;
-
-    let he50 = 0, he100 = 0, atraso = 0;
-    if (falta && cargaMin > 0) atraso = cargaMin;
+    let he50=0, he100=0, atraso=0;
+    if (falta && cargaMin>0) atraso = cargaMin;
     else {
       const exc = totalMin - cargaMin;
       if (ehFeriado) he100 = totalMin;
-      else {
-        if (exc > 0) he50 = exc;
-        else if (exc < 0 && cargaMin > 0) atraso = Math.abs(exc);
-      }
+      else { if(exc>0) he50=exc; else if(exc<0&&cargaMin>0) atraso=Math.abs(exc); }
     }
-
     let intervMin = 0;
-    if (s1 && e2) { intervMin = diffMin(s1, e2); if(intervMin<0) intervMin+=24*60; }
-    const intraMin = (totalMin+intervMin > 360 && intervMin < 60 && !falta) ? (60-intervMin) : 0;
-    const notMin = minNoturnos(e1,s1,ano,mes,d) + minNoturnos(e2,s2,ano,mes,d);
+    if (s1 && e2) { intervMin = diffMin(s1,e2); if(intervMin<0) intervMin+=24*60; }
+    const intraMin = (totalMin+intervMin>360 && intervMin<60 && !falta) ? (60-intervMin) : 0;
+    const notMin   = minNoturnos(e1,s1,ano,mes,d) + minNoturnos(e2,s2,ano,mes,d);
 
-    registros.push({
+    bancoRows.push({
       funcionario: state.funcionario,
       mes_ref: state.mesRef,
       dia: d,
       data_str: k,
-      he_50: he50 / 60,
-      he_100: he100 / 60,
-      atraso: atraso / 60,
-      intrajornada: intraMin / 60,
-      add_noturno: notMin / 60,
-      add_noturno_red: Math.round(notMin*(60/52.5)) / 60,
+      he_50: he50/60,
+      he_100: he100/60,
+      atraso: atraso/60,
+      intrajornada: intraMin/60,
+      add_noturno: notMin/60,
+      add_noturno_red: Math.round(notMin*(60/52.5))/60,
       falta
     });
   }
 
-  if (registros.length === 0) {
-    toast('Nenhum dado para sincronizar.', '');
+  if (!pontoRows.length) { toast('Nenhum lançamento para salvar.', ''); return; }
+
+  try {
+    const func  = encodeURIComponent(state.funcionario);
+    const mesRef = state.mesRef;
+
+    // Apaga registros antigos do mês/funcionário nas duas tabelas
+    await Promise.all([
+      fetch(`${url}/rest/v1/ponto_registros?funcionario=eq.${func}&mes_ref=eq.${mesRef}`,
+        { method:'DELETE', headers: sbHeaders(key) }),
+      fetch(`${url}/rest/v1/banco_horas?funcionario=eq.${func}&mes_ref=eq.${mesRef}`,
+        { method:'DELETE', headers: sbHeaders(key) })
+    ]);
+
+    // Insere novos registros nas duas tabelas
+    const [r1, r2] = await Promise.all([
+      fetch(`${url}/rest/v1/ponto_registros`,
+        { method:'POST', headers: sbHeaders(key), body: JSON.stringify(pontoRows) }),
+      fetch(`${url}/rest/v1/banco_horas`,
+        { method:'POST', headers: sbHeaders(key), body: JSON.stringify(bancoRows) })
+    ]);
+
+    if (r1.ok && r2.ok) toast('✓ Ponto e banco de horas salvos no Supabase!', 'success');
+    else {
+      const err1 = r1.ok ? '' : await r1.text();
+      const err2 = r2.ok ? '' : await r2.text();
+      throw new Error(err1 || err2);
+    }
+  } catch(e) {
+    toast('Erro ao sincronizar: ' + e.message, 'error');
+  }
+}
+
+// Carrega as batidas brutas do Supabase para o funcionário/mês configurado
+async function carregarPontoSupabase() {
+  colherConfig();
+  const { url, key } = getSB();
+  if (!url || !key) {
+    toast('Configure o Supabase no config.js primeiro.', 'error');
+    return;
+  }
+  if (!state.mesRef || !state.funcionario) {
+    toast('Preencha o funcionário e o mês antes de carregar.', 'error');
     return;
   }
 
+  toast('Buscando ponto no Supabase...', '');
   try {
-    // Deleta registros do mês/funcionário e reinsere
-    await fetch(`${url}/rest/v1/banco_horas?funcionario=eq.${encodeURIComponent(state.funcionario)}&mes_ref=eq.${state.mesRef}`, {
-      method: 'DELETE',
-      headers: { 'apikey': key, 'Authorization': `Bearer ${key}` }
+    const func   = encodeURIComponent(state.funcionario);
+    const mesRef = state.mesRef;
+    const res = await fetch(
+      `${url}/rest/v1/ponto_registros?funcionario=eq.${func}&mes_ref=eq.${mesRef}&order=dia.asc`,
+      { headers: { 'apikey': key, 'Authorization': `Bearer ${key}` } }
+    );
+    if (!res.ok) throw new Error(await res.text());
+    const dados = await res.json();
+
+    if (!dados.length) {
+      toast('Nenhum ponto encontrado para este funcionário/mês.', '');
+      gerarTabela();
+      return;
+    }
+
+    // Reconstrói pontoDados a partir do Supabase
+    state.pontoDados = {};
+    dados.forEach(r => {
+      state.pontoDados[r.data_str] = {
+        e1: r.e1 || '', s1: r.s1 || '',
+        e2: r.e2 || '', s2: r.s2 || '',
+        falta: r.falta || false
+      };
     });
 
-    const res = await fetch(`${url}/rest/v1/banco_horas`, {
-      method: 'POST',
-      headers: {
-        'apikey': key,
-        'Authorization': `Bearer ${key}`,
-        'Content-Type': 'application/json',
-        'Prefer': 'return=minimal'
-      },
-      body: JSON.stringify(registros)
-    });
-
-    if (res.ok) toast('Sincronizado com Supabase!', 'success');
-    else throw new Error(await res.text());
+    saveLocal();
+    gerarTabela();
+    toast(`✓ ${dados.length} dia(s) carregados do Supabase!`, 'success');
   } catch(e) {
-    toast('Erro ao sincronizar: ' + e.message, 'error');
+    toast('Erro ao carregar ponto: ' + e.message, 'error');
   }
 }
 
@@ -1218,7 +1295,7 @@ async function sincronizarSupabase() {
 //  BANCO DE HORAS
 // ═══════════════════════════════════════════════
 async function carregarBanco() {
-  const { url, key } = state.supabase;
+  const { url, key } = getSB();
 
   // Se não tem Supabase, calcula do estado local
   if (!url || !key) {
@@ -1353,12 +1430,23 @@ function salvarConfigDB() {
 }
 
 async function testarConexao() {
-  const { url, key } = state.supabase;
-  if (!url || !key) return;
+  const { url, key } = getSB();
   const dot = document.getElementById('supabase-dot');
   const lbl = document.getElementById('supabase-label');
+
+  // Preenche campos do modal com valores atuais (config.js ou localStorage)
+  if (url) document.getElementById('sb-url').value = url;
+  if (key) document.getElementById('sb-key').value = key;
+
+  if (!url || !key) {
+    dot.className = 'status-dot';
+    lbl.textContent = 'Supabase não configurado';
+    return;
+  }
+  dot.className = 'status-dot';
+  lbl.textContent = 'Conectando...';
   try {
-    const res = await fetch(`${url}/rest/v1/banco_horas?limit=1`, {
+    const res = await fetch(`${url}/rest/v1/ponto_registros?limit=1`, {
       headers: { 'apikey': key, 'Authorization': `Bearer ${key}` }
     });
     if (res.ok) {
@@ -1367,7 +1455,7 @@ async function testarConexao() {
     } else throw new Error('HTTP ' + res.status);
   } catch(e) {
     dot.className = 'status-dot error';
-    lbl.textContent = 'Supabase: erro conexão';
+    lbl.textContent = 'Supabase: erro de conexão';
   }
 }
 
@@ -1409,7 +1497,17 @@ function exportarPDF(orientacao) {
 // ═══════════════════════════════════════════════
 //  MODAL
 // ═══════════════════════════════════════════════
-function openModal(id) { document.getElementById(id).classList.add('open'); }
+function openModal(id) {
+  document.getElementById(id).classList.add('open');
+  // Mostra aviso se config.js já está preenchido
+  if (id === 'modal-config-db') {
+    const fromConfig = (typeof SUPABASE_CONFIG !== 'undefined' &&
+                        SUPABASE_CONFIG.url &&
+                        !SUPABASE_CONFIG.url.includes('SEU-PROJETO'));
+    const notice = document.getElementById('sb-config-notice');
+    if (notice) notice.style.display = fromConfig ? 'block' : 'none';
+  }
+}
 function closeModal(id) { document.getElementById(id).classList.remove('open'); }
 document.querySelectorAll('.modal-backdrop').forEach(m => {
   m.addEventListener('click', e => { if(e.target === m) m.classList.remove('open'); });
